@@ -1423,7 +1423,7 @@ class MailAdapter:
                 "may lag Mail by a few minutes."
             ),
         }
-        staleness = mail_index.take_staleness_note()
+        staleness = mail_index.staleness_note()
         if staleness:
             out["staleness"] = staleness
         return out
@@ -1793,7 +1793,7 @@ class MailAdapter:
             result,
             cap=limit,
             plane="applescript-inbox" if used_fallback else None,
-            staleness=mail_index.take_staleness_note(),
+            staleness=mail_index.staleness_note(),
         )
 
     def thread(
@@ -1834,9 +1834,7 @@ class MailAdapter:
                 else p
                 for p in pointers
             ]
-        return read_result(
-            pointers, cap=limit, staleness=mail_index.take_staleness_note()
-        )
+        return read_result(pointers, cap=limit, staleness=mail_index.staleness_note())
 
     def overview(self) -> list[dict]:
         """Per-mailbox {account, mailbox, total, unread}, unread-first.
@@ -1951,7 +1949,7 @@ class MailAdapter:
             ],
             "plane": "envelope-index",
         }
-        staleness = mail_index.take_staleness_note()
+        staleness = mail_index.staleness_note()
         if staleness:
             out["staleness"] = staleness
         return out

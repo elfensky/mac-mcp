@@ -483,3 +483,22 @@ def test_fresh_sidecar_reads_carry_no_note(tmp_path, monkeypatch):
     assert out["results"] and "staleness" not in out
     stats = MailAdapter().stats(days=365000)
     assert "staleness" not in stats
+
+
+def test_a_non_popping_read_cannot_strand_a_stale_note(tmp_path, monkeypatch):
+    # Caught by the rig e2e (2026-09-11): doctor's schema check ran the sidecar
+    # hook while the store was stale, mail_index_ids then closed the gap, and the
+    # NEXT search still reported the stale note the check had left behind —
+    # staleness must be computed per read from the store's CURRENT state, never
+    # relayed through shared module state a different read happened to fill.
+    from macos_apps_mcp.adapters.mail import MailAdapter
+
+    db, side, data = _sidecar_rig(tmp_path, monkeypatch)
+    _arrive(db, data, 200, 900, 90, "Fresh invoice", "<fresh@x>")
+    monkeypatch.setattr(mail_index, "_TOPUP_MAX_ROWS", 0)  # force the stale state
+    assert mail_index.check_index_schema() == "sidecar"  # a read that never pops
+    monkeypatch.setattr(mail_index, "_TOPUP_MAX_ROWS", 200)
+    MailAdapter().index_ids()  # the remediation runs — the gap is closed
+    out = MailAdapter().search(subject="Fresh invoice")
+    assert [p["id"] for p in out["results"]] == ["<fresh@x>"]
+    assert "staleness" not in out  # fresh store, fresh answer — no leftover note

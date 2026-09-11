@@ -798,20 +798,58 @@ _MODE_CACHE: dict[tuple[str, bool], str] = {}
 # past this, the build is mail_index_ids' job — a read must stay a read).
 _TOPUP_MAX_ROWS = 200
 
-# The last sidecar-mode read's staleness finding, if any — popped by the adapter via
-# take_staleness_note() right after its query returns. A module slot, not a return
-# value, because the note is born inside the connection-setup hook where no result
-# channel exists; the single native worker serializes the writers, and a mis-paired
-# pop across two concurrent mail reads would still attach a TRUE statement (the
-# staleness is a property of the store, not of one query).
-_STALENESS_NOTE: str | None = None
 
+def staleness_note() -> str | None:
+    """The sidecar plane's staleness verdict, computed fresh PER CALL — None on a
+    fresh sidecar, on native/floor stores, and when the store is unreadable (the
+    read itself already surfaced that).
 
-def take_staleness_note() -> str | None:
-    """Pop the staleness note the last sidecar-mode read left (None when fresh)."""
-    global _STALENESS_NOTE
-    note, _STALENESS_NOTE = _STALENESS_NOTE, None
-    return note
+    The adapter calls this AFTER its query, and post-read the arithmetic is sharp:
+    a successful sidecar read's setup hook has just topped the high-water mark up
+    to ``max(ROWID)``, so ANY remaining gap means ids are genuinely missing from
+    the answer it is attached to — whether the gap was past the top-up cap, the
+    top-up itself failed, or the mark regressed under an index rebuild.
+
+    This replaced a module-global note the setup hook filled and the adapter
+    popped. The rig e2e caught that design lying in both directions: a read that
+    never pops (doctor's schema check) stranded its note for the NEXT read to
+    report — after ``mail_index_ids`` had already closed the gap the note
+    described. Staleness is a property of the store's current state; only
+    re-deriving it per call keeps every answer paired with the truth at its own
+    read time."""
+    path = envelope_index_path()
+    if path is None:
+        return None
+    try:
+        if _index_mode(path) != "sidecar":
+            return None
+        high_water = mail_ids.stored_high_water(mail_ids.sidecar_path())
+        if high_water is None:
+            return None
+        max_rowid = read_via_sqlite(
+            path,
+            {},
+            lambda conn: conn.execute(
+                "SELECT COALESCE(MAX(ROWID), 0) FROM messages WHERE deleted = 0"
+            ).fetchone()[0],
+            immutable=False,
+        )
+    except NativeError:
+        return None
+    if max_rowid < high_water:
+        return (
+            "Mail's Envelope Index looks rebuilt (its row ids regressed below the "
+            "sidecar's high-water mark) — every Message-ID mapping is suspect until "
+            "mail_index_ids runs a full re-harvest. Answers may cite stale ids."
+        )
+    delta = max_rowid - high_water
+    if delta > 0:
+        return (
+            f"{delta} messages arrived since the Message-ID sidecar was last "
+            "harvested and are missing from sqlite-backed answers — run "
+            "mail_index_ids to catch up."
+        )
+    return None
 
 
 def _index_mode(path) -> str:
@@ -881,16 +919,18 @@ def _sidecar_setup(conn, path) -> None:
     being written), then ATTACH read-only and shadow. sqlite failures here degrade
     exactly like any store-unavailable — runtime wraps them into SchemaDrift."""
     side = mail_ids.sidecar_path()
-    _top_up_or_note(conn, side, path)
+    _maybe_top_up(conn, side, path)
     conn.execute("ATTACH DATABASE ? AS mid", (f"file:{side}?mode=ro",))
     conn.execute(_SHADOW_VIEW_SQL)
 
 
-def _top_up_or_note(conn, side, path) -> None:
-    """Absorb ≤ ``_TOPUP_MAX_ROWS`` of new mail into the sidecar inline; past the
-    cap — or on a detected index rebuild — answer anyway and leave the staleness
-    note naming ``mail_index_ids`` (#156's honesty pattern: never silently stale)."""
-    global _STALENESS_NOTE
+def _maybe_top_up(conn, side, path) -> None:
+    """Absorb ≤ ``_TOPUP_MAX_ROWS`` of new mail into the sidecar inline, so a read
+    answers fresh whenever freshness costs less than ~a second. Anything it does
+    NOT absorb — past the cap, a failed harvest, a rebuilt index — is deliberately
+    left for ``staleness_note()`` to report from the store's post-read state
+    (#156's honesty pattern: never silently stale, and never a note relayed
+    through shared module state)."""
     high_water = mail_ids.stored_high_water(side)
     if high_water is None:
         return  # no mark to measure against; the doctor coverage line reports it
@@ -898,21 +938,9 @@ def _top_up_or_note(conn, side, path) -> None:
         "SELECT COALESCE(MAX(ROWID), 0) FROM messages WHERE deleted = 0"
     ).fetchone()
     if max_rowid < high_water:
-        _STALENESS_NOTE = (
-            "Mail's Envelope Index looks rebuilt (its row ids regressed below the "
-            "sidecar's high-water mark) — every Message-ID mapping is suspect until "
-            "mail_index_ids runs a full re-harvest. Answers may cite stale ids."
-        )
-        return
+        return  # rebuilt index: a full re-harvest is mail_index_ids' job
     delta = max_rowid - high_water
-    if delta == 0:
-        return
-    if delta > _TOPUP_MAX_ROWS:
-        _STALENESS_NOTE = (
-            f"{delta} messages arrived since the Message-ID sidecar was last "
-            "harvested and are missing from sqlite-backed answers — run "
-            "mail_index_ids to catch up."
-        )
+    if delta == 0 or delta > _TOPUP_MAX_ROWS:
         return
     try:
         mail_ids.top_up(
@@ -923,11 +951,7 @@ def _top_up_or_note(conn, side, path) -> None:
             new_high_water=max_rowid,
         )
     except Exception:  # opportunistic freshness must degrade, never kill a read
-        _STALENESS_NOTE = (
-            f"{delta} recent messages could not be absorbed into the Message-ID "
-            "sidecar and are missing from sqlite-backed answers — run "
-            "mail_index_ids."
-        )
+        return
 
 
 def _read_index(path, read, *, fallback=None):

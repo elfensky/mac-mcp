@@ -58,12 +58,13 @@ def _reset_account_map_globals(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_mail_index_mode_globals(monkeypatch):
-    """Reset mail_index's #201 store-mode globals before every test — the same leak
-    class (and the same fix) as the account-map cache above: a mode cached while one
-    test's monkeypatched sidecar existed, or a staleness note a test's read left
-    unpopped, must never leak into the next test's assertions."""
+    """Reset mail_index's #201 store-mode cache before every test — the same leak
+    class (and the same fix) as the account-map cache above: a mode cached while
+    one test's monkeypatched sidecar existed must never leak into the next test's
+    assertions. (Staleness deliberately holds no module state to reset — the
+    global-note design was a cross-read leak in production too, caught by the rig
+    e2e and replaced by the per-call ``staleness_note()``.)"""
     monkeypatch.setattr(mail_index, "_MODE_CACHE", {})
-    monkeypatch.setattr(mail_index, "_STALENESS_NOTE", None)
 
 
 def sequoiaify_envelope(db: Path, side: Path) -> None:
